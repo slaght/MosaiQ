@@ -22,8 +22,8 @@ from sklearn.decomposition import PCA
 import argparse
 
 # Configure a simple logger so debug statements are consistent and optional
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(' ')
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--mode', dest='mode', type=str, default='train')
@@ -36,6 +36,8 @@ parser.add_argument('--log-level', dest='log_level', type=str, default='INFO',
                     help='Logging level: DEBUG, INFO, WARNING, ERROR')
 parser.add_argument('--explain-args', dest='explain_args', action='store_true',
                     help='Print detailed explanations for each CLI argument and exit')
+parser.add_argument('--num-iter', dest='num_iter', type=int, default=20,
+                    help='Number of training iterations (default: 20)')
 
 
 args = parser.parse_args()
@@ -58,6 +60,7 @@ Usage explanation for mosaiq.py arguments:
     --ds: Dataset to use. Supported values: 'MNIST' (default) or 'Fashion'.
     --ds_class: Integer label of the digit/class to train on (default: 5). Only images of this class are used.
     --env: Execution environment for the quantum circuit. 'simulation' (default) uses PennyLane lightning.qubit. Use 'Real' to swap in a function stub for a QPU backend.
+    --num-iter: Number of training iterations to run when in 'train' mode (default: 20).
     --log-level: Logging verbosity. One of DEBUG, INFO (default), WARNING, ERROR.
     --explain-args: Shows this help text and exits.
 
@@ -138,10 +141,10 @@ train_data = scale_data(np.array(train_data), [0, 1])
 # Model / data hyperparameters
 image_size = 5
 batch_size = 8
-pca_dims = 40
-n_qubits = 5
+pca_dims = image_size * batch_size
+n_qubits = image_size
 q_depth = 6
-n_generators = 8
+n_generators = batch_size
 
 # Fit PCA on flattened images and transform
 pca = PCA(n_components=pca_dims)
@@ -275,7 +278,8 @@ class QuantumGenerator(nn.Module):
 
 lrG = 0.3
 lrD = 0.05
-num_iter = 500
+# Number of training iterations (can be overridden via --num-iter)
+num_iter = args.num_iter
 
 gen_losses = []
 disc_losses = []
@@ -351,13 +355,16 @@ if args.mode == 'train':
             np.save(f'upper_bounds_{selected_class_name}', upper_bounds)
             counter += 1
 
+            test_images = generator(noise).detach().numpy()
+            test_images = pca.inverse_transform(test_images)
+            
+            # fid = calculate_fid(test_images.reshape([batch_size, 784]), train_data)
+            # logger.info(f"FID at checkpoint {counter}: {fid}")
+
             # Periodically save diagnostics and generated images
-            if counter % 20 == 0:
-                logger.info(f"Checkpoint: epoch={epoch} batch={batch_idx} counter={counter}")
-                test_images = generator(noise).detach().numpy()
-                test_images = pca.inverse_transform(test_images)
-                fid = calculate_fid(test_images.reshape([batch_size, 784]), train_data)
-                logger.info(f"FID at checkpoint {counter}: {fid}")
+            if counter % 100 == 0:
+                print(f'Iteration: {counter}, Discriminator Loss: {errD:0.3f}, Generator Loss: {errG:0.3f}')
+                # logger.info(f"Checkpoint: epoch={epoch} batch={batch_idx} counter={counter}")
                 test_images = scale_data(test_images, [0, 1])
                 np.save(f'gen_loss_{selected_class_name}', gen_losses)
                 np.save(f'disc_loss_{selected_class_name}', disc_losses)
