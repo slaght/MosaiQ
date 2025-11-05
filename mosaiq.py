@@ -23,7 +23,7 @@ logger = logging.getLogger(' ')
 parser = argparse.ArgumentParser()
 parser.add_argument('--mode', dest='mode', type=str, default='train')
 parser.add_argument('--ds', dest='dataset', type=str, default='MNIST')
-parser.add_argument('--ds_class', dest='ds_class', type=int, default=5)
+parser.add_argument('--ds_class', dest='ds_class', type=str, default='5')
 # parser.add_argument('--env', dest='env', type=str, default='Sim')
 parser.add_argument('--num_iter', dest='num_iter', type=int, default=1000)
 # New: allow adjustable image size (default 20)
@@ -32,6 +32,25 @@ parser.add_argument('--log-level', dest='log_level', type=str, default='INFO',
                     help='Logging level: DEBUG, INFO, WARNING, ERROR')
 parser.add_argument('--explain-args', dest='explain_args', action='store_true',
                     help='Print detailed explanations for each CLI argument and exit')
+# Training stabilization options
+parser.add_argument('--opt', dest='opt', type=str, choices=['sgd','adam'], default='adam',
+                    help='Optimizer: sgd or adam (default: adam)')
+parser.add_argument('--lrG', dest='lrG', type=float, default=2e-4, help='Generator learning rate (default: 2e-4)')
+parser.add_argument('--lrD', dest='lrD', type=float, default=2e-4, help='Discriminator learning rate (default: 2e-4)')
+parser.add_argument('--betas', dest='betas', type=str, default='0.5,0.999',
+                    help='Adam betas as comma-separated pair, e.g. 0.5,0.999')
+parser.add_argument('--label-smooth', dest='label_smooth', type=float, default=0.1,
+                    help='One-sided label smoothing for real labels, e.g. 0.1 -> real=0.9')
+parser.add_argument('--instance-noise', dest='instance_noise', type=float, default=0.02,
+                    help='Stddev of Gaussian instance noise added to D inputs (0 to disable)')
+parser.add_argument('--d-steps', dest='d_steps', type=int, default=1,
+                    help='Number of discriminator updates per generator update')
+parser.add_argument('--pca-dims', dest='pca_dims_arg', type=int, default=None,
+                    help='Override PCA feature count (also sets n_qubits). Use carefully for speed.')
+parser.add_argument('--minibatch-std', dest='minibatch_std', type=int, default=1,
+                    help='Enable minibatch standard deviation trick in D (1 on, 0 off).')
+parser.add_argument('--fm-weight', dest='fm_weight', type=float, default=5.0,
+                    help='Feature matching loss weight added to G loss (default: 5.0).')
 args = parser.parse_args()
 
 numeric_level = getattr(logging, args.log_level.upper(), None)
@@ -48,7 +67,7 @@ Usage explanation for mosaiq.py arguments:
     --mode: Operation mode for the script. 'train' runs GAN training. 'test' runs saved-model evaluation.
     --tr1: Label/name of the first trained generator model to use in test mode (e.g. '5' corresponds to 'generator_5').
     --tr2: Label/name of the second trained generator model to use in test mode.
-    --ds: Dataset to use. Supported values: 'MNIST' (default) or 'Fashion'.
+    --ds: Dataset to use. Supported values: 'MNIST' (default), CIFAR (color) or 'Fashion'.
     --ds_class: Integer label of the digit/class to train on (default: 5). Only images of this class are used.
     # --env: Execution environment for the quantum circuit. 'simulation' (default) uses PennyLane lightning.qubit. Use 'Real' to swap in a function stub for a QPU backend.
     --num-iter: Number of training iterations to run when in 'train' mode (default: 20).
@@ -95,27 +114,89 @@ elif args.dataset == 'Fashion':
         datasets.FashionMNIST('./fashion', download=True, train=True, transform=transform),
         batch_size=10000, shuffle=True
     )
-# Collect only the selected class
+elif args.dataset in ('CIFAR', 'CIFAR10'):
+    # Small color images (RGB). We'll resize to `image_size` and flatten channels.
+    transform = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.ToTensor(),
+        transforms.Lambda(torch.flatten),
+    ])
+    train_loader = torch.utils.data.DataLoader(
+        datasets.CIFAR10('./cifar', download=True, train=True, transform=transform),
+        batch_size=10000, shuffle=True
+    )
+# Collect only the selected class. Accept integer labels or (for CIFAR) class names.
 train_data = []
-selected_class = args.ds_class
+selected_class_arg = args.ds_class
 max_samples = 100  # limit dataset size for faster testing
+
+# Resolve selected class index depending on dataset
+selected_class_idx = None
+if args.dataset in ('CIFAR', 'CIFAR10'):
+    cifar_labels = ['airplane','automobile','bird','cat','deer','dog','frog','horse','ship','truck']
+    # Try interpret as integer index first, else as a name
+    try:
+        selected_class_idx = int(selected_class_arg)
+    except Exception:
+        sc = str(selected_class_arg).strip().lower()
+        if sc == 'all':
+            selected_class_idx = None
+        elif sc in cifar_labels:
+            selected_class_idx = cifar_labels.index(sc)
+        else:
+            raise ValueError(
+                f"Unknown CIFAR class '{selected_class_arg}'. Valid names: {cifar_labels} or integer 0-9"
+            )
+else:
+    # MNIST/Fashion expect an integer class label
+    try:
+        selected_class_idx = int(selected_class_arg)
+    except Exception:
+        raise ValueError("For MNIST/Fashion, --ds_class must be an integer label")
+
 for (data, labels) in train_loader:
     for x, y in zip(data, labels):
-        if int(y) == selected_class:
+        if (selected_class_idx is None) or (int(y) == selected_class_idx):
             train_data.append(x.numpy())
             if len(train_data) >= max_samples:
                 break
     if len(train_data) >= max_samples:
         break
 
+if len(train_data) == 0:
+    raise ValueError(f"No training samples found for class '{selected_class_arg}' in dataset '{args.dataset}'.\n"
+                     f"For CIFAR valid names: {cifar_labels} or integers 0-9. Use '--ds_class all' to use all classes.")
+
 train_data = scale_data(np.array(train_data), [0, 1])  # scale pixels to [0,1]
 
 # Set model dimensions
 image_size = args.image_size        # e.g. 20
-orig_dims = image_size * image_size  # total pixels (400)
 batch_size = 8
-pca_dims = image_size   # compress 400->20 features
-n_qubits = pca_dims     # number of qubits equals number of PCA features
+
+# Derive original flattened dimension from loaded data (handles RGB vs grayscale)
+if train_data.ndim == 2:
+    orig_dims = train_data.shape[1]
+else:
+    # fallback: assume square grayscale
+    orig_dims = image_size * image_size
+
+# Choose PCA dimensionality. For color datasets keep PCA small so the
+# quantum circuit stays reasonably sized. We set pca_dims == n_qubits
+# so the current single-circuit generator (which outputs n_qubits values)
+# produces vectors compatible with PCA inversion.
+if args.dataset in ('CIFAR', 'CIFAR10'):
+    # For CIFAR use a small number of features by default (e.g. 12)
+    pca_dims = min(12, orig_dims)
+else:
+    # For MNIST/Fashion keep the previous convention of compressing to image_size features
+    pca_dims = min(image_size, orig_dims)
+
+# Optional override from CLI
+if args.pca_dims_arg is not None:
+    pca_dims = int(max(1, min(args.pca_dims_arg, orig_dims)))
+
+# Keep qubit count equal to PCA dims to match generator output shape
+n_qubits = pca_dims
 q_depth = 6
 
 # Compute PCA on training images (each flattened vector has length orig_dims)
@@ -129,20 +210,36 @@ dataloader = torch.utils.data.DataLoader(
     scaled_pca_data, batch_size=batch_size, shuffle=True, drop_last=True
 )
 
-# Discriminator (unchanged, input dimension = pca_dims)
+# Discriminator with optional minibatch standard deviation and feature output
 class Discriminator(nn.Module):
-    def __init__(self):
+    def __init__(self, use_minibatch_std: bool = True):
         super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(pca_dims, 64),
-            nn.ReLU(),
-            nn.Linear(64, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1),
-            nn.Sigmoid()
-        )
-    def forward(self, x):
-        return self.model(x)
+        self.use_mbstd = bool(use_minibatch_std)
+        in_dim = pca_dims + (1 if self.use_mbstd else 0)
+        self.fc1 = nn.Linear(in_dim, 64)
+        self.fc2 = nn.Linear(64, 16)
+        self.fc3 = nn.Linear(16, 1)
+        self.act = nn.ReLU()
+        self.out_act = nn.Sigmoid()
+
+    def forward(self, x, return_features: bool = False):
+        # Minibatch standard deviation trick (append one scalar feature)
+        if self.use_mbstd and x.shape[0] > 1:
+            # per-feature std over batch, then average to single scalar
+            eps = 1e-8
+            std_per_feat = torch.sqrt(torch.var(x, dim=0, unbiased=False) + eps)
+            mbstd_scalar = std_per_feat.mean().view(1, 1).expand(x.shape[0], 1)
+            x = torch.cat([x, mbstd_scalar.to(x.device)], dim=1)
+        elif self.use_mbstd:
+            # batch size 1: append zeros
+            x = torch.cat([x, torch.zeros(x.shape[0], 1, device=x.device, dtype=x.dtype)], dim=1)
+
+        h = self.act(self.fc1(x))
+        h = self.act(self.fc2(h))
+        logits = self.out_act(self.fc3(h))
+        if return_features:
+            return logits, h
+        return logits
 
 # Set up PennyLane device with n_qubits wires
 dev = qml.device("lightning.qubit", wires=n_qubits)
@@ -264,14 +361,34 @@ class QuantumGenerator(nn.Module):
 
 # Initialize models and optimizers
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-discriminator = Discriminator().to(device)
+discriminator = Discriminator(use_minibatch_std=bool(args.minibatch_std)).to(device)
 generator = QuantumGenerator().to(device)
 criterion = nn.BCELoss()
-optD = optim.SGD(discriminator.parameters(), lr=0.05)
-optG = optim.SGD(generator.parameters(), lr=0.3)
+# Optimizer selection
+if args.opt == 'adam':
+    try:
+        beta_vals = tuple(float(x) for x in args.betas.split(','))
+        if len(beta_vals) != 2:
+            raise ValueError
+    except Exception:
+        beta_vals = (0.5, 0.999)
+    optD = optim.Adam(discriminator.parameters(), lr=args.lrD, betas=beta_vals)
+    optG = optim.Adam(generator.parameters(), lr=args.lrG, betas=beta_vals)
+else:
+    optD = optim.SGD(discriminator.parameters(), lr=args.lrD, momentum=0.5)
+    optG = optim.SGD(generator.parameters(), lr=args.lrG, momentum=0.5)
 
-real_labels = torch.ones(batch_size, dtype=torch.float, device=device)
+# Labels with optional one-sided smoothing for real labels
+real_label_val = 1.0 - max(0.0, float(args.label_smooth))
+real_labels = torch.full((batch_size,), real_label_val, dtype=torch.float, device=device)
 fake_labels = torch.zeros(batch_size, dtype=torch.float, device=device)
+
+instance_noise_std = float(args.instance_noise)
+
+def add_instance_noise(x, std):
+    if std <= 0:
+        return x
+    return x + torch.randn_like(x) * std
 
 # Training loop (simplified)
 noise_upper_bound = math.pi / 8
@@ -291,20 +408,38 @@ for epoch in range(args.num_iter):
         noise = torch.rand(batch_size, n_qubits, device=device) * noise_upper_bound
         fake_data = generator(noise)  # shape (batch_size, pca_dims)
 
-        # Update Discriminator
-        discriminator.zero_grad()
-        out_real = discriminator(real_data).view(-1)
-        out_fake = discriminator(fake_data.detach()).view(-1)
-        errD = criterion(out_real, real_labels) + criterion(out_fake, fake_labels)
-        errD.backward()
-        optD.step()
+        # Update Discriminator (possibly multiple steps)
+        errD = None
+        for _ in range(max(1, int(args.d_steps))):
+            discriminator.zero_grad()
+            real_in = add_instance_noise(real_data, instance_noise_std)
+            fake_in = add_instance_noise(fake_data.detach(), instance_noise_std)
+            out_real = discriminator(real_in).view(-1)
+            out_fake = discriminator(fake_in).view(-1)
+            errD_step = criterion(out_real, real_labels) + criterion(out_fake, fake_labels)
+            errD_step.backward()
+            optD.step()
+            errD = errD_step
 
-        # Update Generator
-        generator.zero_grad()
-        out_fake_forG = discriminator(fake_data).view(-1)
-        errG = criterion(out_fake_forG, real_labels)
-        errG.backward()
-        optG.step()
+    # Update Generator (with feature matching)
+    generator.zero_grad()
+    fake_forG_in = add_instance_noise(fake_data, instance_noise_std)
+    # Get discriminator outputs and intermediate features
+    out_fake_forG, fake_feats = discriminator(fake_forG_in, return_features=True)
+    out_fake_forG = out_fake_forG.view(-1)
+    # Compute real features (detach to avoid gradients into D)
+    real_for_feats = add_instance_noise(real_data, instance_noise_std)
+    _, real_feats = discriminator(real_for_feats, return_features=True)
+    real_feats = real_feats.detach()
+    # Feature matching: match mean feature activations
+    fm_weight = float(args.fm_weight)
+    mean_fake = torch.mean(fake_feats, dim=0)
+    mean_real = torch.mean(real_feats, dim=0)
+    fm_loss = torch.mean((mean_fake - mean_real) ** 2)
+    # Standard GAN loss + feature matching term
+    errG = criterion(out_fake_forG, real_labels) + fm_weight * fm_loss
+    errG.backward()
+    optG.step()
 
         # Optionally adjust noise schedule (as in original)
         if original_ratio is None:
@@ -325,12 +460,33 @@ for epoch in range(args.num_iter):
 
         # Scale to 0–255 and save each image
         for i in range(min(batch_size, 4)):  # save a few images
-            img = gen_images[i].reshape(image_size, image_size)
-            # optional normalization: clip to [0,1]
-            img = np.clip(img, 0, 1)
-            img_uint8 = (img * 255).astype(np.uint8)
+            # Determine if image is color (channels > 1) or grayscale
+            channels = int(orig_dims // (image_size * image_size)) if image_size > 0 else 1
+            if channels == 1:
+                img = gen_images[i].reshape(image_size, image_size)
+                # optional normalization: clip to [0,1]
+                img = np.clip(img, 0, 1)
+                img_uint8 = (img * 255).astype(np.uint8)
+                im = Image.fromarray(img_uint8)
+            else:
+                # gen_images are flattened in channel-first order (Cf, H, W) because
+                # torchvision.ToTensor produces (C, H, W) and we flattened that.
+                # To reconstruct correctly we must reshape to (C, H, W) and then
+                # move the channel axis to the last position (H, W, C) for PIL.
+                try:
+                    img_chw = gen_images[i].reshape(channels, image_size, image_size)
+                except Exception:
+                    # Fallback: try (H, W, C) in case data already in that order
+                    img_hwc = gen_images[i].reshape(image_size, image_size, channels)
+                    img = np.clip(img_hwc, 0, 1)
+                    img_uint8 = (img * 255).astype(np.uint8)
+                    im = Image.fromarray(img_uint8)
+                else:
+                    img_hwc = np.moveaxis(img_chw, 0, -1)
+                    img = np.clip(img_hwc, 0, 1)
+                    img_uint8 = (img * 255).astype(np.uint8)
+                    im = Image.fromarray(img_uint8)
 
-            im = Image.fromarray(img_uint8)
             save_path = f"gen_images_dist/epoch_{epoch:04d}_sample_{i:02d}.png"
             im.save(save_path)
             print(f"Saved: {save_path}")
@@ -342,8 +498,20 @@ noise = torch.rand(batch_size, n_qubits, device=device) * noise_upper_bound
 gen_pca = generator(noise).detach().cpu().numpy()  # (batch_size, pca_dims)
 gen_images = pca.inverse_transform(gen_pca)      # (batch_size, orig_dims)
 # Reshape and save the first image (thresholded)
-im_array = gen_images[0].reshape(image_size, image_size)
-binary_im = (im_array <= 0.5).astype(np.uint8) * 255  # simple binarization
-from PIL import Image
-Image.fromarray(binary_im).save(f"gen_images_dist/{selected_class}_{epoch}.png")
+channels = int(orig_dims // (image_size * image_size)) if image_size > 0 else 1
+if channels == 1:
+    im_array = gen_images[0].reshape(image_size, image_size)
+    binary_im = (im_array <= 0.5).astype(np.uint8) * 255  # simple binarization
+    Image.fromarray(binary_im).save(f"gen_images_dist/{selected_class}_{epoch}.png")
+else:
+    # reshape from (C*H*W,) -> (C,H,W) then to (H,W,C)
+    try:
+        im_chw = gen_images[0].reshape(channels, image_size, image_size)
+        im_hwc = np.moveaxis(im_chw, 0, -1)
+    except Exception:
+        # fallback if data already in HWC
+        im_hwc = gen_images[0].reshape(image_size, image_size, channels)
+    im_hwc = np.clip(im_hwc, 0, 1)
+    img_uint8 = (im_hwc * 255).astype(np.uint8)
+    Image.fromarray(img_uint8).save(f"gen_images_dist/{selected_class}_{epoch}.png")
 
