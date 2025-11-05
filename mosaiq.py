@@ -41,6 +41,10 @@ parser.add_argument('--pca-dims', dest='pca_dims_arg', type=int, default=None, h
 parser.add_argument('--minibatch-std', dest='minibatch_std', type=int, default=1, help='Enable minibatch standard deviation trick in D (1 on, 0 off).')
 parser.add_argument('--fm-weight', dest='fm_weight', type=float, default=5.0, help='Feature matching loss weight added to G loss (default: 5.0).')
 
+# Patching generator options
+parser.add_argument('--patch-size', dest='patch_size', type=int, default=5, help='Number of qubits/features per patch generator (default: 5).')
+parser.add_argument('--n-generators', dest='n_generators_arg', type=int, default=None, help='Number of patch generators. If not set, computed from PCA dims / patch size.')
+
 # Utility options
 parser.add_argument('--log-level', dest='log_level', type=str, default='INFO', help='Logging level: DEBUG, INFO, WARNING, ERROR')
 parser.add_argument('--explain-args', dest='explain_args', action='store_true', help='Print detailed explanations for each CLI argument and exit')
@@ -60,13 +64,16 @@ Usage explanation for mosaiq.py arguments:
     # --env: Execution environment for the quantum circuit. 'simulation' (default) uses PennyLane lightning.qubit. Use 'Real' to swap in a function stub for a QPU backend.
     --num-iter: Number of training iterations to run when in 'train' mode (default: 20).
     --image_size: Size of the square images to process (default: 20). Images will be resized to image_size x image_size.
+    --patch-size: Number of qubits/features produced by each patch sub-generator (default: 5).
+    --n-generators: Number of patch sub-generators to chain. If not provided, it's inferred so total PCA dims = patch-size * n-generators.
+    --pca-dims: Override total PCA feature count. When using patches, the actual PCA dims may be floored to a multiple of patch-size.
     --log-level: Logging verbosity. One of DEBUG, INFO (default), WARNING, ERROR.
     --explain-args: Shows this help text and exits.
 
 Notes:
     - When running with --mode train the script will save models as 'generator_<ds_class>' and 'disc_<ds_class>'.
     - When running with --mode test, supply --tr1 and --tr2 with the labels of saved models to compare them.
-    - The script expects MNIST data to be available or will download it to './mnist' by default.
+    - The script expects data to be available or will download it into './datasets/<DatasetName>' by default.
 """
         print(help_text)
         import sys
@@ -98,17 +105,17 @@ transform = transforms.Compose([
 
 if args.dataset == 'MNIST':
     train_loader = torch.utils.data.DataLoader(
-        datasets.MNIST('./mnist', download=True, train=True, transform=transform),
+        datasets.MNIST('./datasets', download=True, train=True, transform=transform),
         batch_size=10000, shuffle=True
     )
 elif args.dataset == 'Fashion':
     train_loader = torch.utils.data.DataLoader(
-        datasets.FashionMNIST('./fashion', download=True, train=True, transform=transform),
+        datasets.FashionMNIST('./datasets', download=True, train=True, transform=transform),
         batch_size=10000, shuffle=True
     )
 elif args.dataset in ('CIFAR', 'CIFAR10'):
     train_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10('./cifar', download=True, train=True, transform=transform),
+        datasets.CIFAR10('./datasets', download=True, train=True, transform=transform),
         batch_size=10000, shuffle=True
     )
 else:
@@ -164,7 +171,7 @@ train_data = scale_data(np.array(train_data), [0, 1]) # scale pixels to [0,1]
 # CONTINUE TO COMMENT AFTER HERE:
 
 # Prepare output directories based on dataset and class
-images_dir = os.path.join('gen_images_dist', str(args.dataset).lower(), selected_class_arg)
+images_dir = os.path.join('sample_output', str(args.dataset).lower(), selected_class_arg)
 checkpoints_dir = os.path.join('checkpoints', str(args.dataset).lower(), selected_class_arg)
 os.makedirs(images_dir, exist_ok=True)
 os.makedirs(checkpoints_dir, exist_ok=True)
@@ -180,15 +187,29 @@ else:
     # fallback: assume square grayscale
     orig_dims = image_size * image_size
 
-# Set PCA dims to image_size (20) by default
-pca_dims = min(image_size, orig_dims)
-
-# Optional override from CLI
+# Base PCA dims target: use image_size by default (as in newer version), limited by orig dims
+base_pca_dims = min(image_size, orig_dims)
 if args.pca_dims_arg is not None:
-    pca_dims = int(max(1, min(args.pca_dims_arg, orig_dims)))
+    base_pca_dims = int(max(1, min(args.pca_dims_arg, orig_dims)))
 
-# Keep qubit count equal to PCA dims to match generator output shape
-n_qubits = pca_dims
+# Patching configuration
+patch_size = max(1, int(args.patch_size))
+if args.n_generators_arg is None:
+    # Ensure total PCA dims is a multiple of patch_size by flooring
+    pca_dims = max(patch_size, (base_pca_dims // patch_size) * patch_size)
+    if pca_dims != base_pca_dims:
+        logger.info(f"Adjusting PCA dims from {base_pca_dims} to {pca_dims} to align with patch-size {patch_size}.")
+    n_generators = pca_dims // patch_size
+else:
+    n_generators = max(1, int(args.n_generators_arg))
+    pca_dims = n_generators * patch_size
+    if pca_dims > orig_dims:
+        logger.warning(f"Requested PCA dims ({pca_dims}) exceed available features ({orig_dims}). Reducing to {orig_dims} by adjusting n_generators.")
+        n_generators = max(1, orig_dims // patch_size)
+        pca_dims = n_generators * patch_size
+
+# Number of qubits equals patch size (each sub-generator outputs one patch)
+n_qubits = patch_size
 q_depth = 6
 
 # Compute PCA on training images (each flattened vector has length orig_dims)
@@ -348,25 +369,41 @@ def get_noise_upper_bound(errG, errD, original_ratio, current_noise,
 
 # Quantum Generator (no patching): one parameter tensor of shape (q_depth, n_qubits)
 class QuantumGenerator(nn.Module):
-    def __init__(self, q_delta=1.0):
+    """Patch-based quantum generator composed of multiple sub-generators.
+
+    Each sub-generator produces `patch_size` features (equal to `n_qubits`).
+    Concatenating `n_generators` patches yields a vector of length `pca_dims`.
+    """
+    def __init__(self, n_generators: int, q_delta: float = 1.0):
         super().__init__()
-        # Single parameter tensor instead of a list
-        self.q_params = nn.Parameter(q_delta * torch.rand(q_depth, n_qubits))
-    def forward(self, noise_batch):
-        outputs = []
-        for noise in noise_batch:
-            f = quantum_circuit(noise, self.q_params)
-            # if args.env == 'Real':
-                # f = quantum_circuit_real_machine(noise, self.q_params)
-            # f is a tensor of length n_qubits; convert to float and collect
-            outputs.append(f.float())
-        # Stack into (batch_size, pca_dims) tensor
-        return torch.stack(outputs)
+        self.n_generators = int(n_generators)
+        # One parameter tensor per patch sub-generator
+        self.q_params = nn.ParameterList([
+            nn.Parameter(q_delta * torch.rand(q_depth, n_qubits))
+            for _ in range(self.n_generators)
+        ])
+
+    def forward(self, noise_batch: torch.Tensor) -> torch.Tensor:
+        # noise_batch: (B, n_qubits)
+        B = noise_batch.shape[0]
+        device_in = noise_batch.device
+        patch_mats = []
+        # Generate each patch with its own parameters
+        for params in self.q_params:
+            patch_outputs = []
+            for noise in noise_batch:
+                f = quantum_circuit(noise, params)
+                patch_outputs.append(f.float())
+            patch_mat = torch.stack(patch_outputs)  # (B, n_qubits)
+            patch_mats.append(patch_mat)
+        # Concatenate all patches to form (B, pca_dims)
+        images = torch.cat(patch_mats, dim=1)
+        return images.to(device_in)
 
 # Initialize models and optimizers
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 discriminator = Discriminator(use_minibatch_std=bool(args.minibatch_std)).to(device)
-generator = QuantumGenerator().to(device)
+generator = QuantumGenerator(n_generators=n_generators).to(device)
 criterion = nn.BCELoss()
 # Optimizer selection
 if args.opt == 'adam':
