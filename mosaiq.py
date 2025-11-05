@@ -1,9 +1,8 @@
-# Modified MosaiQ: single-circuit generator for 20x20 images
-
 import os
 from PIL import Image
 import math
 import logging
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy.linalg import sqrtm
 from tqdm import tqdm
@@ -16,48 +15,37 @@ from torchvision import datasets
 import pennylane as qml
 import argparse
 
-# Configure a simple logger so debug statements are consistent and optional
-logging.basicConfig(level=logging.INFO, format='%(message)s')
-logger = logging.getLogger(' ')
 
+# -------------------------------------------------------------------------
+# SCRIPT SETUP
+# -------------------------------------------------------------------------
+
+# Argument parsing --------------------------------------------------------
 parser = argparse.ArgumentParser()
+# Dataset options
 parser.add_argument('--mode', dest='mode', type=str, default='train')
 parser.add_argument('--ds', dest='dataset', type=str, default='MNIST')
 parser.add_argument('--ds_class', dest='ds_class', type=str, default='5')
-# parser.add_argument('--env', dest='env', type=str, default='Sim')
 parser.add_argument('--num_iter', dest='num_iter', type=int, default=1000)
-# New: allow adjustable image size (default 20)
 parser.add_argument('--image_size', dest='image_size', type=int, default=20)
-parser.add_argument('--log-level', dest='log_level', type=str, default='INFO',
-                    help='Logging level: DEBUG, INFO, WARNING, ERROR')
-parser.add_argument('--explain-args', dest='explain_args', action='store_true',
-                    help='Print detailed explanations for each CLI argument and exit')
+
 # Training stabilization options
-parser.add_argument('--opt', dest='opt', type=str, choices=['sgd','adam'], default='adam',
-                    help='Optimizer: sgd or adam (default: adam)')
+parser.add_argument('--opt', dest='opt', type=str, choices=['sgd','adam'], default='adam', help='Optimizer: sgd or adam (default: adam)')
 parser.add_argument('--lrG', dest='lrG', type=float, default=2e-4, help='Generator learning rate (default: 2e-4)')
 parser.add_argument('--lrD', dest='lrD', type=float, default=2e-4, help='Discriminator learning rate (default: 2e-4)')
-parser.add_argument('--betas', dest='betas', type=str, default='0.5,0.999',
-                    help='Adam betas as comma-separated pair, e.g. 0.5,0.999')
-parser.add_argument('--label-smooth', dest='label_smooth', type=float, default=0.1,
-                    help='One-sided label smoothing for real labels, e.g. 0.1 -> real=0.9')
-parser.add_argument('--instance-noise', dest='instance_noise', type=float, default=0.02,
-                    help='Stddev of Gaussian instance noise added to D inputs (0 to disable)')
-parser.add_argument('--d-steps', dest='d_steps', type=int, default=1,
-                    help='Number of discriminator updates per generator update')
-parser.add_argument('--pca-dims', dest='pca_dims_arg', type=int, default=None,
-                    help='Override PCA feature count (also sets n_qubits). Use carefully for speed.')
-parser.add_argument('--minibatch-std', dest='minibatch_std', type=int, default=1,
-                    help='Enable minibatch standard deviation trick in D (1 on, 0 off).')
-parser.add_argument('--fm-weight', dest='fm_weight', type=float, default=5.0,
-                    help='Feature matching loss weight added to G loss (default: 5.0).')
-args = parser.parse_args()
+parser.add_argument('--betas', dest='betas', type=str, default='0.5,0.999', help='Adam betas as comma-separated pair, e.g. 0.5,0.999')
+parser.add_argument('--label-smooth', dest='label_smooth', type=float, default=0.1, help='One-sided label smoothing for real labels, e.g. 0.1 -> real=0.9')
+parser.add_argument('--instance-noise', dest='instance_noise', type=float, default=0.02, help='Stddev of Gaussian instance noise added to D inputs (0 to disable)')
+parser.add_argument('--d-steps', dest='d_steps', type=int, default=1, help='Number of discriminator updates per generator update')
+parser.add_argument('--pca-dims', dest='pca_dims_arg', type=int, default=None, help='Override PCA feature count (also sets n_qubits). Use carefully for speed.')
+parser.add_argument('--minibatch-std', dest='minibatch_std', type=int, default=1, help='Enable minibatch standard deviation trick in D (1 on, 0 off).')
+parser.add_argument('--fm-weight', dest='fm_weight', type=float, default=5.0, help='Feature matching loss weight added to G loss (default: 5.0).')
 
-numeric_level = getattr(logging, args.log_level.upper(), None)
-if not isinstance(numeric_level, int):
-    logger.warning(f"Invalid log level '{args.log_level}', defaulting to INFO")
-    numeric_level = logging.INFO
-logger.setLevel(numeric_level)
+# Utility options
+parser.add_argument('--log-level', dest='log_level', type=str, default='INFO', help='Logging level: DEBUG, INFO, WARNING, ERROR')
+parser.add_argument('--explain-args', dest='explain_args', action='store_true', help='Print detailed explanations for each CLI argument and exit')
+
+args = parser.parse_args()
 
 # If requested, print a helpful explanation for each CLI argument and exit
 if args.explain_args:
@@ -84,51 +72,52 @@ Notes:
         import sys
         sys.exit(0)
 
-# Function to scale numpy data to [min,max]
-def scale_data(data, scale=None, dtype=np.float32):
-    if scale is None:
-        scale = [-1, 1]
-    min_data, max_data = float(np.min(data)), float(np.max(data))
-    min_scale, max_scale = float(scale[0]), float(scale[1])
-    data = ((max_scale - min_scale) * (data - min_data) / (max_data - min_data)) + min_scale
-    return data.astype(dtype)
+# Logger setup --------------------------------------------------------
+# Configure a simple logger so debug statements are consistent and optional
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(' ')
 
+numeric_level = getattr(logging, args.log_level.upper(), None)
+if not isinstance(numeric_level, int):
+    logger.warning(f"Invalid log level '{args.log_level}', defaulting to INFO")
+    numeric_level = logging.INFO
+logger.setLevel(numeric_level)
+
+
+# -------------------------------------------------------------------------
+# DATA LOADING AND PROCESSING
+# -------------------------------------------------------------------------
+
+# Dataset loading ---------------------------------------------------------
 # Load and preprocess dataset, flattening to image_size x image_size
+transform = transforms.Compose([
+    transforms.Resize((args.image_size, args.image_size)),
+    transforms.ToTensor(),
+    transforms.Lambda(torch.flatten),
+])
+
 if args.dataset == 'MNIST':
-    transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Lambda(torch.flatten)
-    ])
     train_loader = torch.utils.data.DataLoader(
         datasets.MNIST('./mnist', download=True, train=True, transform=transform),
         batch_size=10000, shuffle=True
     )
 elif args.dataset == 'Fashion':
-    transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Lambda(torch.flatten)
-    ])
     train_loader = torch.utils.data.DataLoader(
         datasets.FashionMNIST('./fashion', download=True, train=True, transform=transform),
         batch_size=10000, shuffle=True
     )
 elif args.dataset in ('CIFAR', 'CIFAR10'):
-    # Small color images (RGB). We'll resize to `image_size` and flatten channels.
-    transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Lambda(torch.flatten),
-    ])
     train_loader = torch.utils.data.DataLoader(
         datasets.CIFAR10('./cifar', download=True, train=True, transform=transform),
         batch_size=10000, shuffle=True
     )
+else:
+    raise ValueError(f"Unsupported dataset '{args.dataset}'. Supported: MNIST, Fashion, CIFAR")
+
+# Build training data from downloaded dataset -----------------------------
 # Collect only the selected class. Accept integer labels or (for CIFAR) class names.
 train_data = []
 selected_class_arg = args.ds_class
-max_samples = 100  # limit dataset size for faster testing
 
 # Resolve selected class index depending on dataset
 selected_class_idx = None
@@ -139,9 +128,7 @@ if args.dataset in ('CIFAR', 'CIFAR10'):
         selected_class_idx = int(selected_class_arg)
     except Exception:
         sc = str(selected_class_arg).strip().lower()
-        if sc == 'all':
-            selected_class_idx = None
-        elif sc in cifar_labels:
+        if sc in cifar_labels:
             selected_class_idx = cifar_labels.index(sc)
         else:
             raise ValueError(
@@ -158,16 +145,29 @@ for (data, labels) in train_loader:
     for x, y in zip(data, labels):
         if (selected_class_idx is None) or (int(y) == selected_class_idx):
             train_data.append(x.numpy())
-            if len(train_data) >= max_samples:
-                break
-    if len(train_data) >= max_samples:
-        break
 
-if len(train_data) == 0:
-    raise ValueError(f"No training samples found for class '{selected_class_arg}' in dataset '{args.dataset}'.\n"
-                     f"For CIFAR valid names: {cifar_labels} or integers 0-9. Use '--ds_class all' to use all classes.")
+# Function to scale numpy data to [min,max]
+def scale_data(data, scale=None, dtype=np.float32):
+    if scale is None:
+        scale = [-1, 1]
+    min_data, max_data = float(np.min(data)), float(np.max(data))
+    min_scale, max_scale = float(scale[0]), float(scale[1])
+    data = ((max_scale - min_scale) * (data - min_data) / (max_data - min_data)) + min_scale
+    return data.astype(dtype)
 
-train_data = scale_data(np.array(train_data), [0, 1])  # scale pixels to [0,1]
+train_data = scale_data(np.array(train_data), [0, 1]) # scale pixels to [0,1]
+
+
+
+
+
+# CONTINUE TO COMMENT AFTER HERE:
+
+# Prepare output directories based on dataset and class
+images_dir = os.path.join('gen_images_dist', str(args.dataset).lower(), selected_class_arg)
+checkpoints_dir = os.path.join('checkpoints', str(args.dataset).lower(), selected_class_arg)
+os.makedirs(images_dir, exist_ok=True)
+os.makedirs(checkpoints_dir, exist_ok=True)
 
 # Set model dimensions
 image_size = args.image_size        # e.g. 20
@@ -180,16 +180,8 @@ else:
     # fallback: assume square grayscale
     orig_dims = image_size * image_size
 
-# Choose PCA dimensionality. For color datasets keep PCA small so the
-# quantum circuit stays reasonably sized. We set pca_dims == n_qubits
-# so the current single-circuit generator (which outputs n_qubits values)
-# produces vectors compatible with PCA inversion.
-if args.dataset in ('CIFAR', 'CIFAR10'):
-    # For CIFAR use a small number of features by default (e.g. 12)
-    pca_dims = min(12, orig_dims)
-else:
-    # For MNIST/Fashion keep the previous convention of compressing to image_size features
-    pca_dims = min(image_size, orig_dims)
+# Set PCA dims to image_size (20) by default
+pca_dims = min(image_size, orig_dims)
 
 # Optional override from CLI
 if args.pca_dims_arg is not None:
@@ -261,6 +253,31 @@ def quantum_circuit(noise, weights):
     # Return expectation of PauliX on each qubit (one feature per qubit)
     return [qml.expval(qml.PauliX(i)) for i in range(n_qubits)]
 
+# Simple Frechet distance (FID-like) between two sets of flattened images
+def calculate_fid(act1: np.ndarray, act2: np.ndarray) -> float:
+    """Compute Frechet distance between two multivariate Gaussians.
+
+    Parameters
+    ----------
+    act1 : array, shape (n1, d)
+        First set of activations (here: flattened images).
+    act2 : array, shape (n2, d)
+        Second set of activations.
+
+    Returns
+    -------
+    float
+        Frechet distance value (lower is better).
+    """
+    mu1, sigma1 = act1.mean(axis=0), np.cov(act1, rowvar=False)
+    mu2, sigma2 = act2.mean(axis=0), np.cov(act2, rowvar=False)
+    diff = mu1 - mu2
+    covmean = sqrtm(sigma1.dot(sigma2))
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2.0 * covmean)
+    return float(fid)
+
 def get_noise_upper_bound(errG, errD, original_ratio, current_noise,
                           min_noise=1e-4, max_noise=math.pi/2,
                           smoothing=0.9, aggressiveness=0.5):
@@ -329,19 +346,6 @@ def get_noise_upper_bound(errG, errD, original_ratio, current_noise,
     new_noise = float(np.clip(new_noise, min_noise, max_noise))
     return new_noise
 
-# (Optional) QNode for real hardware, not used in simulation
-# def quantum_circuit_real_machine(noise, weights):
-#     weights = weights.reshape(q_depth, n_qubits)
-#     for i in range(n_qubits):
-#         qml.RY(noise[i], wires=i)
-#         qml.RX(noise[i], wires=i)
-#     for i in range(q_depth):
-#         for y in range(n_qubits):
-#             qml.RY(weights[i][y], wires=y)
-#         for y in range(n_qubits - 1):
-#             qml.CZ(wires=[y, y+1])
-#     return [qml.expval(qml.PauliX(i)) for i in range(n_qubits)]
-
 # Quantum Generator (no patching): one parameter tensor of shape (q_depth, n_qubits)
 class QuantumGenerator(nn.Module):
     def __init__(self, q_delta=1.0):
@@ -394,9 +398,27 @@ def add_instance_noise(x, std):
 noise_upper_bound = math.pi / 8
 original_ratio = None
 
-os.makedirs("gen_images_dist", exist_ok=True)
+# Output a diagram of the quantum generator circuit and save a PNG before training starts
+try:
+    sample_noise = torch.zeros(n_qubits, dtype=torch.float32)
+    sample_weights = torch.zeros(q_depth, n_qubits, dtype=torch.float32)
+    ascii_circuit = qml.draw(quantum_circuit)(sample_noise, sample_weights)
+    print("\nQuantum generator circuit:\n" + ascii_circuit)
+    fig, ax = qml.draw_mpl(quantum_circuit)(sample_noise, sample_weights)
+    fig.savefig('quantum_generator.png', bbox_inches='tight', dpi=150)
+    plt.close(fig)
+    print("Saved circuit diagram to quantum_generator.png")
+except Exception as e:
+    print(f"Warning: could not render circuit diagram: {e}")
+
+# Output directories created above per dataset/class
 
 print(f"Starting training... Epochs: {args.num_iter}, Batches: {len(dataloader)}")
+
+# Track history for plots
+epoch_gen_losses = []
+epoch_disc_losses = []
+epoch_fids = []
 
 for epoch in range(args.num_iter):
     for pca_batch in dataloader:
@@ -441,13 +463,12 @@ for epoch in range(args.num_iter):
     errG.backward()
     optG.step()
 
-        # Optionally adjust noise schedule (as in original)
-        if original_ratio is None:
-            original_ratio = errD.detach().item() / errG.detach().item()
-        noise_upper_bound = get_noise_upper_bound(errG, errD, original_ratio, noise_upper_bound)
+    # Optionally adjust noise schedule (as in original)
+    if original_ratio is None:
+        original_ratio = errD.detach().item() / errG.detach().item()
+    noise_upper_bound = get_noise_upper_bound(errG, errD, original_ratio, noise_upper_bound)
 
-    # End of epoch: (optional diagnostics, not shown here)
-    print(f'Epoch: {epoch}, Discriminator Loss: {errD:0.3f}, Generator Loss: {errG:0.3f}')
+    # End of epoch: diagnostics and artifact saving handled below
 
     generator.eval()
     with torch.no_grad():
@@ -458,60 +479,88 @@ for epoch in range(args.num_iter):
         # inverse PCA to reconstruct full image (20x20)
         gen_images = pca.inverse_transform(gen_pca)
 
-        # Scale to 0–255 and save each image
-        for i in range(min(batch_size, 4)):  # save a few images
-            # Determine if image is color (channels > 1) or grayscale
-            channels = int(orig_dims // (image_size * image_size)) if image_size > 0 else 1
-            if channels == 1:
-                img = gen_images[i].reshape(image_size, image_size)
-                # optional normalization: clip to [0,1]
-                img = np.clip(img, 0, 1)
+        # Save only one image per epoch (first sample)
+        i = 0
+        channels = int(orig_dims // (image_size * image_size)) if image_size > 0 else 1
+        if channels == 1:
+            img = gen_images[i].reshape(image_size, image_size)
+            img = np.clip(img, 0, 1)
+            img_uint8 = (img * 255).astype(np.uint8)
+            im = Image.fromarray(img_uint8)
+        else:
+            try:
+                img_chw = gen_images[i].reshape(channels, image_size, image_size)
+            except Exception:
+                img_hwc = gen_images[i].reshape(image_size, image_size, channels)
+                img = np.clip(img_hwc, 0, 1)
                 img_uint8 = (img * 255).astype(np.uint8)
                 im = Image.fromarray(img_uint8)
             else:
-                # gen_images are flattened in channel-first order (Cf, H, W) because
-                # torchvision.ToTensor produces (C, H, W) and we flattened that.
-                # To reconstruct correctly we must reshape to (C, H, W) and then
-                # move the channel axis to the last position (H, W, C) for PIL.
-                try:
-                    img_chw = gen_images[i].reshape(channels, image_size, image_size)
-                except Exception:
-                    # Fallback: try (H, W, C) in case data already in that order
-                    img_hwc = gen_images[i].reshape(image_size, image_size, channels)
-                    img = np.clip(img_hwc, 0, 1)
-                    img_uint8 = (img * 255).astype(np.uint8)
-                    im = Image.fromarray(img_uint8)
-                else:
-                    img_hwc = np.moveaxis(img_chw, 0, -1)
-                    img = np.clip(img_hwc, 0, 1)
-                    img_uint8 = (img * 255).astype(np.uint8)
-                    im = Image.fromarray(img_uint8)
+                img_hwc = np.moveaxis(img_chw, 0, -1)
+                img = np.clip(img_hwc, 0, 1)
+                img_uint8 = (img * 255).astype(np.uint8)
+                im = Image.fromarray(img_uint8)
 
-            save_path = f"gen_images_dist/epoch_{epoch:04d}_sample_{i:02d}.png"
-            im.save(save_path)
-            print(f"Saved: {save_path}")
+        save_path = os.path.join(images_dir, f"epoch_{epoch:04d}.png")
+        im.save(save_path)
+
+    # Compute FID for this epoch using a subset of real data
+    try:
+        real_pool = train_data
+        # Use up to 1000 real samples for speed
+        max_real = 1000
+        if real_pool.shape[0] > max_real:
+            idx = np.random.choice(real_pool.shape[0], size=max_real, replace=False)
+            real_sample = real_pool[idx]
+        else:
+            real_sample = real_pool
+        # Flatten generated images (already (batch, orig_dims))
+        gen_flat = gen_images.reshape(gen_images.shape[0], -1)
+        fid_value = calculate_fid(gen_flat, real_sample)
+    except Exception as e:
+        fid_value = float('nan')
+        print(f"Warning: FID computation failed at epoch {epoch}: {e}")
+
+    # Update histories and save plots
+    epoch_disc_losses.append(float(errD.detach().item()))
+    epoch_gen_losses.append(float(errG.detach().item()))
+    epoch_fids.append(float(fid_value))
+
+    # Plot and save losses
+    try:
+        plt.figure(figsize=(6,4))
+        plt.plot(epoch_disc_losses, label='D loss')
+        plt.plot(epoch_gen_losses, label='G loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(images_dir, 'loss.png'))
+        plt.close()
+    except Exception as e:
+        print(f"Warning: could not save loss plot: {e}")
+
+    # Plot and save FID
+    try:
+        plt.figure(figsize=(6,4))
+        plt.plot(epoch_fids, label='FID')
+        plt.xlabel('Epoch')
+        plt.ylabel('FID (lower is better)')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(images_dir, 'fid.png'))
+        plt.close()
+    except Exception as e:
+        print(f"Warning: could not save FID plot: {e}")
+
+    # Log epoch summary with FID
+    print(f"Epoch: {epoch}, D Loss: {epoch_disc_losses[-1]:0.4f}, G Loss: {epoch_gen_losses[-1]:0.4f}, FID: {epoch_fids[-1]:0.2f}")
+
+    # Save models for this dataset/class after each epoch
+    torch.save(generator.state_dict(), os.path.join(checkpoints_dir, f"G_epoch_{epoch:04d}.pt"))
+    torch.save(discriminator.state_dict(), os.path.join(checkpoints_dir, f"D_epoch_{epoch:04d}.pt"))
+    # Also keep latest symlinks/files for convenience
+    torch.save(generator.state_dict(), os.path.join(checkpoints_dir, "G_latest.pt"))
+    torch.save(discriminator.state_dict(), os.path.join(checkpoints_dir, "D_latest.pt"))
 
     generator.train()
-
-# After training: generate and invert PCA to images for visualization
-noise = torch.rand(batch_size, n_qubits, device=device) * noise_upper_bound
-gen_pca = generator(noise).detach().cpu().numpy()  # (batch_size, pca_dims)
-gen_images = pca.inverse_transform(gen_pca)      # (batch_size, orig_dims)
-# Reshape and save the first image (thresholded)
-channels = int(orig_dims // (image_size * image_size)) if image_size > 0 else 1
-if channels == 1:
-    im_array = gen_images[0].reshape(image_size, image_size)
-    binary_im = (im_array <= 0.5).astype(np.uint8) * 255  # simple binarization
-    Image.fromarray(binary_im).save(f"gen_images_dist/{selected_class}_{epoch}.png")
-else:
-    # reshape from (C*H*W,) -> (C,H,W) then to (H,W,C)
-    try:
-        im_chw = gen_images[0].reshape(channels, image_size, image_size)
-        im_hwc = np.moveaxis(im_chw, 0, -1)
-    except Exception:
-        # fallback if data already in HWC
-        im_hwc = gen_images[0].reshape(image_size, image_size, channels)
-    im_hwc = np.clip(im_hwc, 0, 1)
-    img_uint8 = (im_hwc * 255).astype(np.uint8)
-    Image.fromarray(img_uint8).save(f"gen_images_dist/{selected_class}_{epoch}.png")
-
