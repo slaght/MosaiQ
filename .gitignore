@@ -112,3 +112,13 @@ docker-compose.override.yml
 *.sqlite3
 
 # End of file
+
+# Project-specific ignores
+# Prevent committing large training artifacts and datasets
+checkpoints/
+
+# The CIFAR tarball previously caused push failures (>100MB); keep it ignored
+cifar/cifar-10-python.tar.gz
+
+# Optional: ignore compressed archives by default (uncomment if desired)
+# *.tar.gz
