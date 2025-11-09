@@ -402,6 +402,7 @@ class QuantumGenerator(nn.Module):
 
 # Initialize models and optimizers
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
 discriminator = Discriminator(use_minibatch_std=bool(args.minibatch_std)).to(device)
 generator = QuantumGenerator(n_generators=n_generators).to(device)
 criterion = nn.BCELoss()
