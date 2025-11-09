@@ -122,3 +122,7 @@ cifar/cifar-10-python.tar.gz
 
 # Optional: ignore compressed archives by default (uncomment if desired)
 # *.tar.gz
+
+# Datasets: ignore problematic archives
+datasets/cifar-10-python.tar.gz
+datasets/**/cifar-10-python.tar.gz
